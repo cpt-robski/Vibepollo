@@ -1,5 +1,12 @@
 #include "include/base_vs_types.hlsl"
 
+#if defined(SOURCE_CROP_TRANSFORM)
+cbuffer source_crop_cbuffer : register(b4) {
+    float2 source_crop_scale;
+    float2 source_crop_offset;
+};
+#endif
+
 vertex_t generate_fullscreen_triangle_vertex(uint vertex_id, float2 subsample_offset, int rotate_texture_steps)
 {
     vertex_t output;
@@ -30,6 +37,10 @@ vertex_t generate_fullscreen_triangle_vertex(uint vertex_id, float2 subsample_of
             subsample_offset.xy = subsample_offset.yx;
         }
     }
+
+#if defined(SOURCE_CROP_TRANSFORM)
+tex_coord = tex_coord * source_crop_scale + source_crop_offset;
+#endif
 
 #if defined(LEFT_SUBSAMPLING)
     output.tex_right_left_center = float3(tex_coord.x, tex_coord.x - subsample_offset.x, tex_coord.y);

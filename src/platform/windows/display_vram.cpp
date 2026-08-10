@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <cstdlib>
 
 // platform includes
 #include <winsock2.h>
@@ -841,6 +842,13 @@ namespace platf::dxgi {
         truehdr_live_readback_request.reset();
       }
 #endif
+      if (!source_crop) {
+        BOOST_LOG(error) << "[TILED-TEST] Source crop buffer is missing during conversion";
+        return -1;
+      }
+
+      device_ctx->VSSetConstantBuffers(4, 1, &source_crop);
+
       draw(
         *encode_input_res,
         out_Y_or_YUV_viewports,
@@ -1347,6 +1355,41 @@ namespace platf::dxgi {
           return -1;
         }
         device_ctx->VSSetConstantBuffers(1, 1, &rotation);
+      }
+
+      {
+        float crop_scale_x = 1.0f;
+        float crop_offset_x = 0.0f;
+
+        if (const char *crop_mode_env = std::getenv("VIBEPOLLO_TILED_TEST_CROP")) {
+          const std::string_view crop_mode {crop_mode_env};
+
+          if (crop_mode == "left") {
+            crop_scale_x = 0.5f;
+            crop_offset_x = 0.0f;
+          } else if (crop_mode == "right") {
+            crop_scale_x = 0.5f;
+            crop_offset_x = 0.5f;
+          }
+        }
+
+        float source_crop_data[4] {
+          crop_scale_x,
+          1.0f,
+          crop_offset_x,
+          0.0f
+        };
+
+        source_crop = make_buffer(device.get(), source_crop_data);
+        if (!source_crop) {
+          BOOST_LOG(error) << "Failed to create source crop vertex constant buffer";
+          return -1;
+        }
+
+        BOOST_LOG(info)
+          << "[TILED-TEST] Source crop configured: scale=("
+          << crop_scale_x << ",1)"
+          << " offset=(" << crop_offset_x << ",0)";
       }
 
       output_y_or_yuv_rtv_format = DXGI_FORMAT_UNKNOWN;
@@ -1954,6 +1997,8 @@ namespace platf::dxgi {
     std::array<D3D11_VIEWPORT, 3> out_Y_or_YUV_viewports_for_clear;
     D3D11_VIEWPORT out_UV_viewport;
     D3D11_VIEWPORT out_UV_viewport_for_clear;
+
+    buf_t source_crop;
 
     DXGI_FORMAT format;
   };

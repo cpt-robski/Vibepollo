@@ -7,6 +7,7 @@ cbuffer rotate_texture_steps_cbuffer : register(b1) {
 };
 
 #define LEFT_SUBSAMPLING
+#define SOURCE_CROP_TRANSFORM
 #include "include/base_vs.hlsl"
 
 vertex_t main_vs(uint vertex_id : SV_VertexID)

@@ -1151,6 +1151,18 @@ namespace video {
       if (!device) {
         return -1;
       }
+
+      static std::atomic<uint64_t> tiled_test_frame_count {0};
+      const auto frame_count = tiled_test_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
+
+      if (frame_count <= 5 || frame_count % 120 == 0) {
+        BOOST_LOG(info)
+          << "[TILED-TEST] QSV/AVCodec input frame #" << frame_count
+          << " size=" << img.width << "x" << img.height
+          << " row_pitch=" << img.row_pitch
+          << " img=" << static_cast<const void *>(&img);
+      }
+
       return device->convert(img);
     }
 
