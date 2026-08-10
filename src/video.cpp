@@ -3132,6 +3132,53 @@ namespace video {
     return 0;
   }
 
+  int encode_avcodec_discard(
+    int64_t frame_nr,
+    avcodec_encode_session_t &session,
+    std::size_t &encoded_bytes
+  ) {
+    auto &frame = session.device->frame;
+    frame->pts = frame_nr;
+
+    auto &ctx = session.avcodec_ctx;
+
+    auto ret = avcodec_send_frame(ctx.get(), frame);
+    if (ret < 0) {
+      char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+      BOOST_LOG(error)
+        << "[TILED-TEST] Secondary encoder could not accept frame "
+        << frame_nr << ": "
+        << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
+      return -1;
+    }
+
+    encoded_bytes = 0;
+
+    while (ret >= 0) {
+      auto packet = std::make_unique<packet_raw_avcodec>();
+      auto av_packet = packet->av_packet;
+
+      ret = avcodec_receive_packet(ctx.get(), av_packet);
+
+      if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        return 0;
+      }
+
+      if (ret < 0) {
+        char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+        BOOST_LOG(error)
+          << "[TILED-TEST] Secondary encoder failed receiving frame "
+          << frame_nr << ": "
+          << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
+        return -1;
+      }
+
+      encoded_bytes += static_cast<std::size_t>(av_packet->size);
+    }
+
+    return 0;
+  }
+
   int encode_nvenc(
     int64_t frame_nr,
     nvenc_encode_session_t &session,
@@ -4479,6 +4526,63 @@ namespace video {
       if (initialization_gate_contended) return encode_run_result_e::temporarily_busy;
       return encode_run_result_e::initialization_failed;
     }
+
+    std::unique_ptr<encode_session_t> tiled_test_secondary_session;
+
+    #ifdef _WIN32
+    const char *tiled_dual_env = std::getenv("VIBEPOLLO_TILED_DUAL_TEST");
+    const bool tiled_dual_test =
+      tiled_dual_env && std::string_view {tiled_dual_env} == "1";
+
+    if (tiled_dual_test) {
+      if (!dynamic_cast<avcodec_encode_session_t *>(session.get())) {
+        BOOST_LOG(warning)
+          << "[TILED-TEST] Dual encoder test requested, but primary encoder is not AVCodec/QSV; "
+            "secondary encoder will not be created.";
+      } else {
+        BOOST_LOG(info)
+          << "[TILED-TEST] Creating secondary AVCodec encoder for RIGHT tile";
+
+        const char *old_crop_env = std::getenv("VIBEPOLLO_TILED_TEST_CROP");
+        const std::string old_crop = old_crop_env ? old_crop_env : "";
+
+        _putenv_s("VIBEPOLLO_TILED_TEST_CROP", "right");
+
+        auto secondary_device =
+          make_encode_device(*disp, encoder, config, hdr_latch, false);
+
+        if (secondary_device) {
+          tiled_test_secondary_session = make_encode_session(
+            disp.get(),
+            encoder,
+            config,
+            disp->width,
+            disp->height,
+            std::move(secondary_device),
+            initialization_deadline,
+            initialization_cancelled
+          );
+        }
+
+        if (old_crop.empty()) {
+          _putenv_s("VIBEPOLLO_TILED_TEST_CROP", "");
+        } else {
+          _putenv_s("VIBEPOLLO_TILED_TEST_CROP", old_crop.c_str());
+        }
+
+        if (!tiled_test_secondary_session) {
+          BOOST_LOG(error)
+            << "[TILED-TEST] Failed to create secondary AVCodec encoder";
+          return encode_run_result_e::initialization_failed;
+        }
+
+        BOOST_LOG(info)
+          << "[TILED-TEST] Secondary AVCodec encoder created successfully";
+      }
+    }
+    #endif
+
+
     // One RTTI lookup for the whole session — the pointer stays valid until the
     // fail_guard teardown moves the session out after the encode loop exits.
     auto *const native_session = dynamic_cast<amf_encode_session_t *>(session.get());
@@ -4691,8 +4795,16 @@ namespace video {
       // allocation which can be freed immediately after convert(), so we do this
       // in a separate scope.
       auto dummy_img = disp->alloc_img();
+
       if (!dummy_img || disp->dummy_img(dummy_img.get()) || session->convert(*dummy_img)) {
         return native_amf_failure();
+      }
+
+      if (tiled_test_secondary_session &&
+          tiled_test_secondary_session->convert(*dummy_img)) {
+        BOOST_LOG(error)
+          << "[TILED-TEST] Could not convert dummy image for secondary encoder";
+        return encode_run_result_e::initialization_failed;
       }
     }
 
@@ -4941,6 +5053,14 @@ namespace video {
             break;
           }
 
+          if (tiled_test_secondary_session) {
+            if (tiled_test_secondary_session->convert(*img)) {
+              BOOST_LOG(error)
+                << "[TILED-TEST] Could not convert image for secondary encoder";
+              break;
+            }
+          }
+
 #ifdef SUNSHINE_ENABLE_NV_TRUEHDR
           if (refresh_rtx_hdr_metadata_if_needed(
                 config,
@@ -4989,11 +5109,58 @@ namespace video {
         continue;
       }
 
-      if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp)) {
+      const auto current_frame_nr = frame_nr++;
+
+      if (encode(
+            current_frame_nr,
+            *session,
+            packets,
+            channel_data,
+            frame_timestamp,
+            capture_timestamp,
+            host_processing_timestamp
+          )) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         native_amf_runtime_failed = native_amf_session;
         break;
       }
+
+      if (tiled_test_secondary_session) {
+        auto *secondary_avcodec =
+          dynamic_cast<avcodec_encode_session_t *>(tiled_test_secondary_session.get());
+
+        if (!secondary_avcodec) {
+          BOOST_LOG(error)
+            << "[TILED-TEST] Secondary session unexpectedly stopped being AVCodec";
+          break;
+        }
+
+        std::size_t secondary_bytes = 0;
+
+        if (encode_avcodec_discard(
+              current_frame_nr,
+              *secondary_avcodec,
+              secondary_bytes
+            )) {
+          BOOST_LOG(error)
+            << "[TILED-TEST] Secondary encoder failed on frame "
+            << current_frame_nr;
+          break;
+        }
+
+        static uint64_t tiled_test_encoded_frames = 0;
+        ++tiled_test_encoded_frames;
+
+        if (tiled_test_encoded_frames <= 5 ||
+            tiled_test_encoded_frames % 120 == 0) {
+          BOOST_LOG(info)
+            << "[TILED-TEST] Dual encode frame="
+            << current_frame_nr
+            << " secondary_bytes="
+            << secondary_bytes;
+        }
+      }
+
       ++loop_stats.encoded;
 
       // A dropped submission leaves a hole in the wire frameIndex sequence, which
