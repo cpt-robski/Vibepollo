@@ -308,14 +308,15 @@ namespace video {
 
   struct packet_raw_t {
     virtual ~packet_raw_t() = default;
-
     virtual bool is_idr() = 0;
-
     virtual int64_t frame_index() = 0;
-
     virtual uint8_t *data() = 0;
-
     virtual size_t data_size() = 0;
+    
+    // Video tile carried by this encoded frame.
+    // 0 preserves the existing single-stream behavior.
+    uint8_t tile_id = 0;
+
 
     struct replace_t {
       std::string_view old;

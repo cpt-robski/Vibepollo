@@ -3051,7 +3051,8 @@ namespace video {
     void *channel_data,
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
     std::optional<std::chrono::steady_clock::time_point> capture_timestamp,
-    std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp
+    std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp,
+    uint8_t tile_id
   ) {
     auto &frame = session.device->frame;
     frame->pts = frame_nr;
@@ -3122,9 +3123,14 @@ namespace video {
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
-      if (webrtc_stream::has_active_sessions()) {
+      packet->tile_id = tile_id;
+
+      // WebRTC is still a conventional single-video-stream path.
+      // Do not expose the experimental secondary tile there.
+      if (tile_id == 0 && webrtc_stream::has_active_sessions()) {
         webrtc_stream::submit_video_packet(*packet);
       }
+
       packet->packet_enqueue_timestamp = std::chrono::steady_clock::now();
       packets->raise(std::move(packet));
     }
@@ -3296,7 +3302,7 @@ namespace video {
     const auto encode_start = std::chrono::steady_clock::now();
     int result = -1;
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
-      result = encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp);
+      result = encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp, 0);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       result = encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp);
     } else if (auto amf_session = dynamic_cast<amf_encode_session_t *>(&session)) {
@@ -5156,12 +5162,15 @@ namespace video {
           break;
         }
 
-        std::size_t secondary_bytes = 0;
-
-        if (encode_avcodec_discard(
+        if (encode_avcodec(
               current_frame_nr,
               *secondary_avcodec,
-              secondary_bytes
+              packets,
+              channel_data,
+              frame_timestamp,
+              capture_timestamp,
+              host_processing_timestamp,
+              1
             )) {
           BOOST_LOG(error)
             << "[TILED-TEST] Secondary encoder failed on frame "
@@ -5175,13 +5184,10 @@ namespace video {
         if (tiled_test_encoded_frames <= 5 ||
             tiled_test_encoded_frames % 120 == 0) {
           BOOST_LOG(info)
-            << "[TILED-TEST] Dual encode frame="
-            << current_frame_nr
-            << " secondary_bytes="
-            << secondary_bytes;
+            << "[TILED-TEST] Native secondary tile queued frame="
+            << current_frame_nr;
         }
       }
-
       ++loop_stats.encoded;
 
       // A dropped submission leaves a hole in the wire frameIndex sequence, which

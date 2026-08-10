@@ -572,6 +572,7 @@ namespace stream {
       std::string ping_payload;
 
       int lowseq;
+      int tiled_right_lowseq;
       udp::endpoint peer;
 
       std::optional<crypto::cipher::gcm_t> cipher;
@@ -1927,7 +1928,10 @@ namespace stream {
         last_frame_timestamp = *packet->frame_timestamp;
       }
 
-      auto lowseq = session->video.lowseq;
+      auto lowseq =
+        packet->tile_id == 1 ?
+          session->video.tiled_right_lowseq :
+          session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
       std::vector<uint8_t> payload_with_replacements;
@@ -2156,6 +2160,13 @@ namespace stream {
             inspect->rtp.sequenceNumber = util::endian::big<uint16_t>(lowseq + x);
             inspect->rtp.timestamp = util::endian::big<uint32_t>(timestamp);
 
+            // Keep SSRC 0 for the primary stream to preserve existing GameStream
+            // behavior. The secondary tiled stream uses a distinct SSRC ("MLT1")
+            // so the custom Moonlight client can demultiplex it before FEC.
+            inspect->rtp.ssrc = util::endian::big<uint32_t>(
+              packet->tile_id == 1 ? 0x4D4C5431u : 0u
+            );
+
             inspect->packet.multiFecBlocks = (blockIndex << 4) | ((fec_blocks_needed - 1) << 6);
             inspect->packet.frameIndex = (uint32_t) packet->frame_index();
 
@@ -2244,6 +2255,17 @@ namespace stream {
 
           frame_network_latency_logger.second_point_now_and_log();
 
+          if (packet->frame_index() <= 5 || packet->frame_index() % 120 == 0) {
+            BOOST_LOG(info)
+              << "[TILED-TRANSPORT] tile=" << static_cast<int>(packet->tile_id)
+              << " frame=" << packet->frame_index()
+              << " ssrc=0x"
+              << std::hex
+              << (packet->tile_id == 1 ? 0x4D4C5431u : 0u)
+              << std::dec
+              << " next_seq=" << lowseq;
+          }
+
           BOOST_LOG(verbose) << "Sent Frame seq ["sv << packet->frame_index() << "] pts ["sv << timestamp
                              << "] shards ["sv << shards.size() << "/"sv << shards.percentage << "%]"sv
                              << (frame_is_dupe ? " Dupe" : "")
@@ -2254,7 +2276,12 @@ namespace stream {
           lowseq += shards.size();
         });
 
-        session->video.lowseq = lowseq;
+        if (packet->tile_id == 1) {
+          session->video.tiled_right_lowseq = lowseq;
+        }
+        else {
+          session->video.lowseq = lowseq;
+        }
 
         // Update per-session performance counters
         session->stats.frames_sent.fetch_add(1, std::memory_order_relaxed);
@@ -3249,6 +3276,7 @@ namespace stream {
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
       session->video.bitrate_events = mail->event<int>(mail::dynamic_bitrate);
       session->video.lowseq = 0;
+      session->video.tiled_right_lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
         BOOST_LOG(info) << "Video encryption enabled"sv;
