@@ -1163,7 +1163,16 @@ namespace platf::dxgi {
       return 0;
     }
 
-    int init_output(ID3D11Texture2D *frame_texture, int width, int height, const ::video::sunshine_colorspace_t &colorspace) {
+    int init_output(
+      ID3D11Texture2D *frame_texture,
+      int width,
+      int height,
+      const ::video::sunshine_colorspace_t &colorspace,
+      float source_crop_scale_x = 1.0f,
+      float source_crop_scale_y = 1.0f,
+      float source_crop_offset_x = 0.0f,
+      float source_crop_offset_y = 0.0f
+    ) {
 
       HRESULT status = S_OK;
 
@@ -1189,11 +1198,27 @@ namespace platf::dxgi {
       const auto display_width = display ? display->width : detached_display_width;
       const auto display_height = display ? display->height : detached_display_height;
       const auto display_rotation = display ? display->display_rotation : detached_display_rotation;
+
       if (display_width <= 0 || display_height <= 0) {
         BOOST_LOG(error) << "Missing source display geometry for D3D11 encoder initialization";
         return -1;
       }
-      const bool downscaling = display_width > width || display_height > height;
+
+      const float effective_source_width =
+        static_cast<float>(display_width) * source_crop_scale_x;
+
+      const float effective_source_height =
+        static_cast<float>(display_height) * source_crop_scale_y;
+
+      if (effective_source_width <= 0.0f || effective_source_height <= 0.0f) {
+        BOOST_LOG(error) << "Invalid cropped source geometry for D3D11 encoder initialization";
+        return -1;
+      }
+
+      const bool downscaling =
+        effective_source_width > width ||
+        effective_source_height > height;
+
       const bool target_hdr = ::video::colorspace_is_hdr(colorspace);
 
       switch (format) {
@@ -1310,10 +1335,11 @@ namespace platf::dxgi {
       auto out_width = width;
       auto out_height = height;
 
-      float in_width = display_width;
-      float in_height = display_height;
+      float in_width = effective_source_width;
+      float in_height = effective_source_height;
 
-      // Ensure aspect ratio is maintained
+      // Ensure aspect ratio is maintained against the cropped source region,
+      // not against the dimensions of the full captured display.
       auto scalar = std::fminf(out_width / in_width, out_height / in_height);
       auto out_width_f = in_width * scalar;
       auto out_height_f = in_height * scalar;
@@ -1358,26 +1384,11 @@ namespace platf::dxgi {
       }
 
       {
-        float crop_scale_x = 1.0f;
-        float crop_offset_x = 0.0f;
-
-        if (const char *crop_mode_env = std::getenv("VIBEPOLLO_TILED_TEST_CROP")) {
-          const std::string_view crop_mode {crop_mode_env};
-
-          if (crop_mode == "left") {
-            crop_scale_x = 0.5f;
-            crop_offset_x = 0.0f;
-          } else if (crop_mode == "right") {
-            crop_scale_x = 0.5f;
-            crop_offset_x = 0.5f;
-          }
-        }
-
         float source_crop_data[4] {
-          crop_scale_x,
-          1.0f,
-          crop_offset_x,
-          0.0f
+          source_crop_scale_x,
+          source_crop_scale_y,
+          source_crop_offset_x,
+          source_crop_offset_y
         };
 
         source_crop = make_buffer(device.get(), source_crop_data);
@@ -1388,8 +1399,15 @@ namespace platf::dxgi {
 
         BOOST_LOG(info)
           << "[TILED-TEST] Source crop configured: scale=("
-          << crop_scale_x << ",1)"
-          << " offset=(" << crop_offset_x << ",0)";
+          << source_crop_scale_x << ','
+          << source_crop_scale_y << ") offset=("
+          << source_crop_offset_x << ','
+          << source_crop_offset_y << ") effective_source="
+          << effective_source_width << 'x'
+          << effective_source_height
+          << " output="
+          << width << 'x'
+          << height;
       }
 
       output_y_or_yuv_rtv_format = DXGI_FORMAT_UNKNOWN;
@@ -2121,7 +2139,16 @@ namespace platf::dxgi {
         frame_texture = (ID3D11Texture2D *) frame->data[0];
       }
 
-      return base.init_output(frame_texture, frame->width, frame->height, colorspace);
+      return base.init_output(
+        frame_texture,
+        frame->width,
+        frame->height,
+        colorspace,
+        source_crop_scale_x,
+        source_crop_scale_y,
+        source_crop_offset_x,
+        source_crop_offset_y
+      );
     }
 
   private:

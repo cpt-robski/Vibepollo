@@ -4508,14 +4508,47 @@ namespace video {
     rtx_hdr_metadata_refresh_state_t &rtx_hdr_metadata_refresh
   ) {
     const encoder_t *session_encoder = &encoder;
+
+    const char *tiled_dual_env = std::getenv("VIBEPOLLO_TILED_DUAL_TEST");
+    const bool tiled_dual_test =
+      tiled_dual_env &&
+      std::string_view {tiled_dual_env} == "1" &&
+      dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get()) != nullptr;
+
+    config_t encoder_config = config;
+
+    if (tiled_dual_test) {
+      if ((encoder_config.width & 1) != 0) {
+        BOOST_LOG(error)
+          << "[TILED-TEST] Cannot split odd encoder width "
+          << encoder_config.width;
+        return encode_run_result_e::initialization_failed;
+      }
+
+      encoder_config.width /= 2;
+
+      encode_device->source_crop_scale_x = 0.5f;
+      encode_device->source_crop_scale_y = 1.0f;
+      encode_device->source_crop_offset_x = 0.0f;
+      encode_device->source_crop_offset_y = 0.0f;
+
+      BOOST_LOG(info)
+        << "[TILED-TEST] Dual tile mode: capture="
+        << disp->width << 'x' << disp->height
+        << " client="
+        << config.width << 'x' << config.height
+        << " tile_encoder="
+        << encoder_config.width << 'x' << encoder_config.height;
+    }
+
     bool initialization_was_cancelled = false;
     bool initialization_gate_contended = false;
     auto session = prepared_session ?
-                     std::move(prepared_session) :
-                     make_encode_session(
-                       disp.get(), encoder, config, disp->width, disp->height,
-                       std::move(encode_device), initialization_deadline, initialization_cancelled,
-                       &initialization_was_cancelled, &initialization_gate_contended);
+                  std::move(prepared_session) :
+                  make_encode_session(
+                    disp.get(), encoder, encoder_config, disp->width, disp->height,
+                    std::move(encode_device), initialization_deadline, initialization_cancelled,
+                    &initialization_was_cancelled, &initialization_gate_contended);
 #ifdef _WIN32
     if (initialization_was_cancelled) return encode_run_result_e::completed;
     if (!session && &encoder == &amdvce) {
@@ -4530,55 +4563,43 @@ namespace video {
     std::unique_ptr<encode_session_t> tiled_test_secondary_session;
 
     #ifdef _WIN32
-    const char *tiled_dual_env = std::getenv("VIBEPOLLO_TILED_DUAL_TEST");
-    const bool tiled_dual_test =
-      tiled_dual_env && std::string_view {tiled_dual_env} == "1";
-
     if (tiled_dual_test) {
-      if (!dynamic_cast<avcodec_encode_session_t *>(session.get())) {
-        BOOST_LOG(warning)
-          << "[TILED-TEST] Dual encoder test requested, but primary encoder is not AVCodec/QSV; "
-            "secondary encoder will not be created.";
-      } else {
-        BOOST_LOG(info)
-          << "[TILED-TEST] Creating secondary AVCodec encoder for RIGHT tile";
+      BOOST_LOG(info)
+        << "[TILED-TEST] Creating secondary AVCodec encoder for RIGHT tile";
 
-        const char *old_crop_env = std::getenv("VIBEPOLLO_TILED_TEST_CROP");
-        const std::string old_crop = old_crop_env ? old_crop_env : "";
+      auto secondary_device =
+        make_encode_device(*disp, encoder, encoder_config, hdr_latch, false);
 
-        _putenv_s("VIBEPOLLO_TILED_TEST_CROP", "right");
-
-        auto secondary_device =
-          make_encode_device(*disp, encoder, config, hdr_latch, false);
-
-        if (secondary_device) {
-          tiled_test_secondary_session = make_encode_session(
-            disp.get(),
-            encoder,
-            config,
-            disp->width,
-            disp->height,
-            std::move(secondary_device),
-            initialization_deadline,
-            initialization_cancelled
-          );
-        }
-
-        if (old_crop.empty()) {
-          _putenv_s("VIBEPOLLO_TILED_TEST_CROP", "");
-        } else {
-          _putenv_s("VIBEPOLLO_TILED_TEST_CROP", old_crop.c_str());
-        }
-
-        if (!tiled_test_secondary_session) {
-          BOOST_LOG(error)
-            << "[TILED-TEST] Failed to create secondary AVCodec encoder";
-          return encode_run_result_e::initialization_failed;
-        }
-
-        BOOST_LOG(info)
-          << "[TILED-TEST] Secondary AVCodec encoder created successfully";
+      if (!secondary_device) {
+        BOOST_LOG(error)
+          << "[TILED-TEST] Failed to create secondary encode device";
+        return encode_run_result_e::initialization_failed;
       }
+
+      secondary_device->source_crop_scale_x = 0.5f;
+      secondary_device->source_crop_scale_y = 1.0f;
+      secondary_device->source_crop_offset_x = 0.5f;
+      secondary_device->source_crop_offset_y = 0.0f;
+
+      tiled_test_secondary_session = make_encode_session(
+        disp.get(),
+        encoder,
+        encoder_config,
+        disp->width,
+        disp->height,
+        std::move(secondary_device),
+        initialization_deadline,
+        initialization_cancelled
+      );
+
+      if (!tiled_test_secondary_session) {
+        BOOST_LOG(error)
+          << "[TILED-TEST] Failed to create secondary AVCodec encoder";
+        return encode_run_result_e::initialization_failed;
+      }
+
+      BOOST_LOG(info)
+        << "[TILED-TEST] Secondary AVCodec encoder created successfully";
     }
     #endif
 

@@ -402,6 +402,13 @@ namespace platf {
     video::sunshine_colorspace_t colorspace;
     bool rtx_hdr_active = false;
 
+    // Source-region transform used by tiled video encoding.
+    // Identity values preserve the existing full-frame behavior.
+    float source_crop_scale_x = 1.0f;
+    float source_crop_scale_y = 1.0f;
+    float source_crop_offset_x = 0.0f;
+    float source_crop_offset_y = 0.0f;
+
     // Authoritative HDR metadata for the stream, resolved once at device creation so the
     // control-channel HDR mode message and the bitstream mastering-display SEI always agree,
     // and so no consumer re-queries a display that may transiently read SDR during a reinit.
