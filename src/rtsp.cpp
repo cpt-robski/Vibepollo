@@ -1418,6 +1418,9 @@ namespace rtsp_stream {
     // Tell the client about our supported features
     ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
 
+    // Custom Moonlight tiled-video extension
+    ss << "a=x-ss-video.tilingVersion:1" << std::endl;
+
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
     uint32_t encryption_flags_requested = SS_ENC_CONTROL_V2;
@@ -1664,6 +1667,22 @@ namespace rtsp_stream {
 
       config.monitor.height = (int) util::from_view(args.at("x-nv-video[0].clientViewportHt"sv));
       config.monitor.width = (int) util::from_view(args.at("x-nv-video[0].clientViewportWd"sv));
+      constexpr std::uint32_t kMlFeatureVideoTilingV1 = 0x04;
+
+      const bool client_supports_video_tiling =
+          (static_cast<std::uint32_t>(config.mlFeatureFlags) &
+          kMlFeatureVideoTilingV1) != 0;
+
+      config.monitor.tiled_video =
+          client_supports_video_tiling &&
+          config.monitor.width > 4096;
+
+      BOOST_LOG(info)
+        << "[TILED-NEGOTIATION] client_flags=" << config.mlFeatureFlags
+        << " tiling_v1=" << (client_supports_video_tiling ? "yes" : "no")
+        << " requested=" << config.monitor.width << "x" << config.monitor.height
+        << " enabled=" << (config.monitor.tiled_video ? "yes" : "no");
+
       config.monitor.framerate = (int) util::from_view(args.at("x-nv-video[0].maxFPS"sv));
       config.monitor.framerateX100 = (int) util::from_view(args.at("x-nv-video[0].clientRefreshRateX100"sv));
       config.monitor.bitrate = (int) util::from_view(args.at("x-nv-vqos[0].bw.maximumBitrateKbps"sv));

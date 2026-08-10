@@ -4515,11 +4515,7 @@ namespace video {
   ) {
     const encoder_t *session_encoder = &encoder;
 
-    const char *tiled_dual_env = std::getenv("VIBEPOLLO_TILED_DUAL_TEST");
-    const bool tiled_dual_test =
-      tiled_dual_env &&
-      std::string_view {tiled_dual_env} == "1" &&
-      dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get()) != nullptr;
+    const bool tiled_dual_test = config.tiled_video;
 
     config_t encoder_config = config;
 

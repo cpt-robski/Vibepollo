@@ -72,6 +72,7 @@ namespace video {
     // subtracts FEC/audio/control overhead from `bitrate` for the encoder.
     // Same as `bitrate` for clients that don't send maximumBitrateKbps.
     int client_requested_bitrate;
+    bool tiled_video = false;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
