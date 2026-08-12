@@ -5393,23 +5393,42 @@ namespace video {
           break;
         }
 
+        const auto to_ms = [](auto duration) {
+          return std::chrono::duration<double, std::milli>(
+            duration
+          ).count();
+        };
+
+        const auto processing_time =
+          tiled_perf_primary_convert_time +
+          tiled_perf_secondary_convert_time +
+          tiled_perf_primary_encode_time +
+          tiled_perf_secondary_encode_time;
+
+        const auto total_work_time =
+          tiled_perf_pop_time +
+          processing_time;
+
         if (current_frame_nr <= 5 ||
             current_frame_nr % 120 == 0) {
 
-          const auto to_ms = [](auto duration) {
-            return std::chrono::duration<double, std::milli>(
-              duration
-            ).count();
-          };
-
-          const auto processing_time =
-            tiled_perf_primary_convert_time +
-            tiled_perf_secondary_convert_time +
-            tiled_perf_primary_encode_time +
-            tiled_perf_secondary_encode_time;
-
           BOOST_LOG(info)
             << "[TILED-PERF] frame=" << current_frame_nr
+            << " pop=" << to_ms(tiled_perf_pop_time) << "ms"
+            << " conv0=" << to_ms(tiled_perf_primary_convert_time) << "ms"
+            << " conv1=" << to_ms(tiled_perf_secondary_convert_time) << "ms"
+            << " enc0=" << to_ms(tiled_perf_primary_encode_time) << "ms"
+            << " enc1=" << to_ms(tiled_perf_secondary_encode_time) << "ms"
+            << " processing=" << to_ms(processing_time) << "ms";
+        }
+
+        // Log every unusually expensive tiled frame, rather than relying on
+        // the 120-frame sampling above. At 60 FPS our total frame budget is
+        // 16.67 ms, so 12 ms is an early-warning threshold.
+        if (total_work_time >= 12ms) {
+          BOOST_LOG(info)
+            << "[TILED-SLOW] frame=" << current_frame_nr
+            << " total=" << to_ms(total_work_time) << "ms"
             << " pop=" << to_ms(tiled_perf_pop_time) << "ms"
             << " conv0=" << to_ms(tiled_perf_primary_convert_time) << "ms"
             << " conv1=" << to_ms(tiled_perf_secondary_convert_time) << "ms"

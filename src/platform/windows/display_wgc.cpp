@@ -97,16 +97,9 @@ namespace platf::dxgi {
         return {};
       }
 
-      const auto base_rate = static_cast<std::uint64_t>(config.framerate);
-      const auto max_admission = static_cast<std::uint64_t>((std::numeric_limits<int>::max)());
-      const auto desktop_admission = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-        base_rate * 2ull,
-        max_admission
-      ));
-      const auto game_admission = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-        base_rate * 4ull,
-        max_admission
-      ));
+      // TEMP TEST: hold WGC admission at 240 FPS regardless of desktop/game state.
+      const std::uint32_t desktop_admission = 240;
+      const std::uint32_t game_admission = 240;
 
       return platf::game_activity::make_refresh_target({
         .display_name = display_name,

@@ -2028,6 +2028,12 @@ namespace platf::dxgi {
 
   class d3d_avcodec_encode_device_t: public avcodec_encode_device_t {
   public:
+    ~d3d_avcodec_encode_device_t() override {
+      // Release the current frame before its hwframes context.
+      hwframe.reset();
+      av_buffer_unref(&hw_frames_ctx_ref);
+    }
+    
     int init(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter_p, pix_fmt_e pix_fmt) {
       if (!prepare_device(std::move(display), adapter_p, pix_fmt)) return -1;
       return initialize_hardware_device() ? 0 : -1;
@@ -2066,6 +2072,12 @@ namespace platf::dxgi {
     }
 
     int convert(platf::img_t &img_base) override {
+      if (dynamic_qsv_frames) {
+        if (prepare_next_qsv_frame()) {
+          return -1;
+        }
+      }
+
       return base.convert(img_base);
     }
 
@@ -2083,8 +2095,31 @@ namespace platf::dxgi {
         d3d11_frames->MiscFlags = 0;
       }
 
-      // We require a single texture
-      frames->initial_pool_size = 1;
+      // Only opt the tiled/cropped QSV path into dynamic input surfaces.
+      // Keep the normal Sunshine QSV path unchanged for this experiment.
+      const bool cropped_qsv =
+        frames->device_ctx->type == AV_HWDEVICE_TYPE_QSV &&
+        (
+          source_crop_scale_x != 1.0f ||
+          source_crop_scale_y != 1.0f ||
+          source_crop_offset_x != 0.0f ||
+          source_crop_offset_y != 0.0f
+        );
+
+      if (cropped_qsv) {
+        // Zero selects FFmpeg's dynamic QSV/D3D11 frame pool. Each in-flight
+        // encode can therefore own a different D3D11 texture.
+        frames->initial_pool_size = 0;
+
+        base.enable_dynamic_output_textures();
+        dynamic_qsv_frames = true;
+
+        BOOST_LOG(info)
+          << "[TILED-QSV] Dynamic QSV input surfaces enabled";
+      } else {
+        // Preserve existing behaviour for non-tiled encoders.
+        frames->initial_pool_size = 1;
+      }
     }
 
     int prepare_to_derive_context(int hw_device_type) override {
@@ -2108,52 +2143,152 @@ namespace platf::dxgi {
       this->hwframe.reset(frame);
       this->frame = frame;
 
-      // Populate this frame with a hardware buffer if one isn't there already
+      if (dynamic_qsv_frames) {
+        av_buffer_unref(&hw_frames_ctx_ref);
+        hw_frames_ctx_ref = av_buffer_ref(hw_frames_ctx);
+
+        if (!hw_frames_ctx_ref) {
+          BOOST_LOG(error)
+            << "[TILED-QSV] Failed to retain hwframes context";
+          return -1;
+        }
+      }
+
+      // Populate this frame with a hardware buffer if one isn't there already.
       if (!frame->buf[0]) {
         auto err = av_hwframe_get_buffer(hw_frames_ctx, frame, 0);
         if (err) {
           char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
-          BOOST_LOG(error) << "Failed to get hwframe buffer: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, err);
+          BOOST_LOG(error)
+            << "Failed to get hwframe buffer: "
+            << av_make_error_string(
+                 err_str,
+                 AV_ERROR_MAX_STRING_SIZE,
+                 err
+               );
           return -1;
         }
       }
 
-      // If this is a frame from a derived context, we'll need to map it to D3D11
-      ID3D11Texture2D *frame_texture;
-      if (frame->format != AV_PIX_FMT_D3D11) {
-        frame_t d3d11_frame {av_frame_alloc()};
-
-        d3d11_frame->format = AV_PIX_FMT_D3D11;
-
-        auto err = av_hwframe_map(d3d11_frame.get(), frame, AV_HWFRAME_MAP_WRITE | AV_HWFRAME_MAP_OVERWRITE);
-        if (err) {
-          char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
-          BOOST_LOG(error) << "Failed to map D3D11 frame: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, err);
-          return -1;
-        }
-
-        // Get the texture from the mapped frame
-        frame_texture = (ID3D11Texture2D *) d3d11_frame->data[0];
-      } else {
-        // Otherwise, we can just use the texture inside the original frame
-        frame_texture = (ID3D11Texture2D *) frame->data[0];
-      }
-
-      return base.init_output(
-        frame_texture,
-        frame->width,
-        frame->height,
-        colorspace,
-        source_crop_scale_x,
-        source_crop_scale_y,
-        source_crop_offset_x,
-        source_crop_offset_y
-      );
+      return bind_output_frame(frame, true);
     }
 
   private:
+    int bind_output_frame(AVFrame *frame, bool initialize) {
+      ID3D11Texture2D *frame_texture = nullptr;
+
+      if (frame->format != AV_PIX_FMT_D3D11) {
+        frame_t d3d11_frame {av_frame_alloc()};
+
+        if (!d3d11_frame) {
+          return -1;
+        }
+
+        d3d11_frame->format = AV_PIX_FMT_D3D11;
+
+        auto err = av_hwframe_map(
+          d3d11_frame.get(),
+          frame,
+          AV_HWFRAME_MAP_WRITE | AV_HWFRAME_MAP_OVERWRITE
+        );
+
+        if (err) {
+          char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+          BOOST_LOG(error)
+            << "Failed to map D3D11 frame: "
+            << av_make_error_string(
+                 err_str,
+                 AV_ERROR_MAX_STRING_SIZE,
+                 err
+               );
+          return -1;
+        }
+
+        frame_texture =
+          (ID3D11Texture2D *) d3d11_frame->data[0];
+      } else {
+        frame_texture =
+          (ID3D11Texture2D *) frame->data[0];
+      }
+
+      if (initialize) {
+        return base.init_output(
+          frame_texture,
+          frame->width,
+          frame->height,
+          colorspace,
+          source_crop_scale_x,
+          source_crop_scale_y,
+          source_crop_offset_x,
+          source_crop_offset_y
+        );
+      }
+
+      return base.set_output_texture(frame_texture);
+    }
+
+    int prepare_next_qsv_frame() {
+      if (!hw_frames_ctx_ref || !frame) {
+        BOOST_LOG(error)
+          << "[TILED-QSV] Dynamic frame state is not initialized";
+        return -1;
+      }
+
+      frame_t next_frame {av_frame_alloc()};
+
+      if (!next_frame) {
+        return -1;
+      }
+
+      auto err =
+        av_hwframe_get_buffer(
+          hw_frames_ctx_ref,
+          next_frame.get(),
+          0
+        );
+
+      if (err < 0) {
+        char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+        BOOST_LOG(error)
+          << "[TILED-QSV] Failed to acquire next QSV surface: "
+          << av_make_error_string(
+               err_str,
+               AV_ERROR_MAX_STRING_SIZE,
+               err
+             );
+        return -1;
+      }
+
+      // Carry IDR state, HDR side-data, colour properties, etc. forward
+      // from the previously active frame.
+      err = av_frame_copy_props(next_frame.get(), frame);
+
+      if (err < 0) {
+        char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+        BOOST_LOG(error)
+          << "[TILED-QSV] Failed to copy frame properties: "
+          << av_make_error_string(
+               err_str,
+               AV_ERROR_MAX_STRING_SIZE,
+               err
+             );
+        return -1;
+      }
+
+      if (bind_output_frame(next_frame.get(), false)) {
+        return -1;
+      }
+
+      hwframe = std::move(next_frame);
+      frame = hwframe.get();
+
+      return 0;
+    }
+
     d3d_base_encode_device base;
     frame_t hwframe;
+    AVBufferRef *hw_frames_ctx_ref = nullptr;
+    bool dynamic_qsv_frames = false;
     adapter_t initialization_adapter;
     DXGI_ADAPTER_DESC adapter_desc {};
     pix_fmt_e buffer_format = pix_fmt_e::unknown;
