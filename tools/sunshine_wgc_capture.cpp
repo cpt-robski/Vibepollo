@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -36,6 +37,7 @@
 
 // platform includes
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <inspectable.h>  // For IInspectable
 #include <KnownFolders.h>
@@ -521,6 +523,23 @@ public:
       BOOST_LOG(error) << "Failed to create D3D11 device: " << std::hex << hr << std::dec;
       return false;
     }
+
+    // The WGC FrameArrived callback and the delivery thread both submit work
+    // through this immediate context. Enable D3D11's built-in multithread
+    // protection so they don't need to hold our own mutex while waiting on
+    // unrelated cross-process synchronization.
+    auto multithread = _context.try_as<ID3D11Multithread>();
+    if (!multithread) {
+      BOOST_LOG(error) << "Failed to query ID3D11Multithread from WGC D3D11 immediate context";
+      return false;
+    }
+
+    const BOOL was_multithread_protected =
+      multithread->SetMultithreadProtected(TRUE);
+
+    BOOST_LOG(info)
+      << "WGC D3D11 immediate-context multithread protection enabled"
+      << " (previously=" << (was_multithread_protected ? "enabled" : "disabled") << ")";
 
     // Set GPU thread priority to 7 for optimal capture performance under high GPU load
     _dxgi_device = _device.try_as<IDXGIDevice>();
@@ -1470,11 +1489,17 @@ private:
       _last_diagnostics_slow_copy = slow_copy;
       _last_diagnostics_activity_rate_limited = activity_rate_limited;
 
+      const double capture_fps =
+        static_cast<double>(captured_delta) / interval_s;
+
+      const double publish_fps =
+        static_cast<double>(published_delta) / interval_s;
+
       BOOST_LOG(info) << "WGC capture diagnostics: interval_s=" << interval_s
                       << " buffer=" << _current_buffer_size << "/" << _max_buffer_size
                       << " approx_extra_pool_latency_ms=" << approximate_extra_pool_latency_ms(_current_buffer_size)
-                      << " capture_fps=" << (static_cast<double>(captured_delta) / interval_s)
-                      << " publish_fps=" << (static_cast<double>(published_delta) / interval_s)
+                      << " capture_fps=" << capture_fps
+                      << " publish_fps=" << publish_fps
                       << " drained=" << drained_delta
                       << " activity_rate_limited=" << activity_rate_limited_delta
                       << " empty_drops=" << empty_drop_delta
@@ -1484,7 +1509,41 @@ private:
                       << " slow_mutex=" << slow_mutex_delta
                       << " slow_shared_hold=" << slow_hold_delta
                       << " slow_copy=" << slow_copy_delta;
+
+      // Temporary diagnostic sidecar:
+      // The WGC helper's Boost logs are not reaching sunshine.log, so write
+      // the same producer/delivery counters directly to Apollo's config dir.
+      {
+        const auto diag_path =
+          std::filesystem::temp_directory_path() /
+          "wgc_helper_diag.log";
+
+        std::ofstream diag(
+          diag_path,
+          std::ios::out | std::ios::app
+        );
+
+        if (diag) {
+          diag << "pid=" << GetCurrentProcessId()
+               << " interval_s=" << interval_s
+               << " buffer=" << _current_buffer_size << "/" << _max_buffer_size
+               << " capture_fps=" << capture_fps
+               << " publish_fps=" << publish_fps
+               << " drained=" << drained_delta
+               << " activity_rate_limited=" << activity_rate_limited_delta
+               << " empty_drops=" << empty_drop_delta
+               << " delivery_replaced=" << replaced_delta
+               << " scratch_dropped=" << scratch_dropped_delta
+               << " slow_context=" << slow_context_delta
+               << " slow_mutex=" << slow_mutex_delta
+               << " slow_shared_hold=" << slow_hold_delta
+               << " slow_copy=" << slow_copy_delta
+               << '\n';
+        }
+      }
+
       return;
+
     }
   }
 
@@ -1739,10 +1798,10 @@ private:
       return;
     }
 
-    {
-      std::lock_guard context_lock(_d3d_context_mutex);
-      _deps->d3d_context->CopyResource(_scratch_textures[*scratch_index].texture.get(), frame_tex.get());
-    }
+    _deps->d3d_context->CopyResource(
+      _scratch_textures[*scratch_index].texture.get(),
+      frame_tex.get()
+    );
 
     // From here on the delivery thread owns only the helper scratch texture, not
     // the Direct3D11CaptureFrame/WGC frame-pool buffer. The helper can wait for
@@ -1823,13 +1882,10 @@ private:
       return;
     }
 
-    // Take the helper-local D3D context lock before the cross-process keyed
-    // mutex. The callback thread also uses this context for scratch copies; if
-    // GPU load makes that copy slow, waiting here must not block Sunshine from
-    // acquiring the shared WGC texture.
-    const auto context_wait_start = std::chrono::steady_clock::now();
-    std::unique_lock context_lock(_d3d_context_mutex);
-    const auto context_wait = std::chrono::steady_clock::now() - context_wait_start;
+    // D3D11 immediate-context multithread protection is enabled at device
+    // creation, so the FrameArrived and delivery threads can submit context
+    // work independently without our own long-lived context mutex.
+    const auto context_wait = std::chrono::steady_clock::duration::zero();
 
     const auto mutex_wait_start = std::chrono::steady_clock::now();
     HRESULT hr = _deps->resource_manager.get_keyed_mutex()->AcquireSync(0, 200);
@@ -1875,7 +1931,6 @@ private:
       return;
     }
     const auto shared_mutex_hold = std::chrono::steady_clock::now() - shared_mutex_hold_start;
-    context_lock.unlock();
 
     // Signal only after releasing the mutex so a woken consumer can acquire the
     // frame without waiting on the producer's normal release path.

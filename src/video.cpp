@@ -1761,7 +1761,7 @@ namespace video {
       {
         {"preset"s, &config::video.qsv.qsv_preset},
         {"forced_idr"s, 1},
-        {"async_depth"s, 1},
+        {"async_depth"s, 2},
         {"low_delay_brc"s, 1},
         {"low_power"s, 1},
         {"recovery_point_sei"s, 0},
@@ -1797,7 +1797,7 @@ namespace video {
         {"preset"s, &config::video.qsv.qsv_preset},
         {"cavlc"s, &config::video.qsv.qsv_cavlc},
         {"forced_idr"s, 1},
-        {"async_depth"s, 1},
+        {"async_depth"s, 2},
         {"low_delay_brc"s, 1},
         {"low_power"s, 1},
         {"recovery_point_sei"s, 0},
@@ -2844,7 +2844,7 @@ namespace video {
             const auto wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - *wait_start).count();
             ++image_pool_wait_count;
             if (image_pool_wait_count <= 5 || wait_ms > 1.5 || image_pool_wait_count % 120 == 0) {
-              BOOST_LOG(debug) << "Capture image pool waited " << wait_ms
+              BOOST_LOG(info) << "Capture image pool waited " << wait_ms
                                << "ms for a free image"
                                << " iterations=" << wait_iterations
                                << " count=" << image_pool_wait_count;
@@ -2874,8 +2874,92 @@ namespace video {
 
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
+      uint64_t tiled_capture_interval_count = 0;
+      uint64_t tiled_capture_no_frame_count = 0;
 
+      std::optional<std::chrono::steady_clock::time_point>
+        tiled_capture_last_frame_time;
+
+      double tiled_capture_interval_sum_ms = 0.0;
+      double tiled_capture_interval_min_ms = 0.0;
+      double tiled_capture_interval_max_ms = 0.0;
+
+      uint64_t tiled_capture_over_16ms = 0;
+      uint64_t tiled_capture_over_25ms = 0;
+      uint64_t tiled_capture_over_33ms = 0;
+      uint64_t tiled_capture_over_50ms = 0;
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
+
+        if (frame_captured) {
+          const auto now =
+            std::chrono::steady_clock::now();
+
+          if (tiled_capture_last_frame_time) {
+            const double interval_ms =
+              std::chrono::duration<double, std::milli>(
+                now - *tiled_capture_last_frame_time
+              ).count();
+
+            ++tiled_capture_interval_count;
+            tiled_capture_interval_sum_ms += interval_ms;
+
+            if (tiled_capture_interval_count == 1) {
+              tiled_capture_interval_min_ms = interval_ms;
+              tiled_capture_interval_max_ms = interval_ms;
+            } else {
+              tiled_capture_interval_min_ms =
+                std::min(tiled_capture_interval_min_ms, interval_ms);
+
+              tiled_capture_interval_max_ms =
+                std::max(tiled_capture_interval_max_ms, interval_ms);
+            }
+
+            if (interval_ms > 16.67) {
+              ++tiled_capture_over_16ms;
+            }
+
+            if (interval_ms > 25.0) {
+              ++tiled_capture_over_25ms;
+            }
+
+            if (interval_ms > 33.33) {
+              ++tiled_capture_over_33ms;
+            }
+
+            if (interval_ms > 50.0) {
+              ++tiled_capture_over_50ms;
+            }
+
+            if ((tiled_capture_interval_count % 120) == 0) {
+              BOOST_LOG(info)
+                << "[TILED-CAPTURE] frames="
+                << tiled_capture_interval_count
+                << " avg="
+                << (tiled_capture_interval_sum_ms /
+                    tiled_capture_interval_count)
+                << "ms min="
+                << tiled_capture_interval_min_ms
+                << "ms max="
+                << tiled_capture_interval_max_ms
+                << "ms >16.67="
+                << tiled_capture_over_16ms
+                << " >25="
+                << tiled_capture_over_25ms
+                << " >33.33="
+                << tiled_capture_over_33ms
+                << " >50="
+                << tiled_capture_over_50ms
+                << " no_frame="
+                << tiled_capture_no_frame_count;
+            }
+          }
+
+          tiled_capture_last_frame_time = now;
+        }
+        else {
+          ++tiled_capture_no_frame_count;
+        }
+
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
           if (!capture_ctx->images->running()) {
             capture_ctx = capture_ctxs.erase(capture_ctx);
@@ -4912,6 +4996,11 @@ namespace video {
       std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
     } loop_stats;
 
+    // TILED TEST:
+    // Capture may run faster than the negotiated stream. This is the independent
+    // output clock: one encoding opportunity per negotiated frame interval.
+    std::optional<std::chrono::steady_clock::time_point> tiled_next_output_slot;
+
     while (true) {
       if (auto now = std::chrono::steady_clock::now(); now - loop_stats.last_log >= 10s) {
         BOOST_LOG(debug) << "Encode loop [" << channel_data << "] " << config.width << 'x' << config.height
@@ -4980,6 +5069,12 @@ namespace video {
       std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
       std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
       bool placeholder_input = bootstrap_state.current_input_placeholder;
+
+      std::chrono::nanoseconds tiled_perf_pop_time {0};
+      std::chrono::nanoseconds tiled_perf_primary_convert_time {0};
+      std::chrono::nanoseconds tiled_perf_secondary_convert_time {0};
+      std::chrono::nanoseconds tiled_perf_primary_encode_time {0};
+      std::chrono::nanoseconds tiled_perf_secondary_encode_time {0};
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
@@ -5055,8 +5150,67 @@ namespace video {
           image_wait_budget = std::min(image_wait_budget, remaining_tail_budget);
         }
 
-        if (auto img = images->pop(image_wait_budget)) {
-          placeholder_input = is_placeholder_capture_image(*img);
+        // TILED TEST:
+        // Once we have seen the first real frame, pace encoding independently
+        // from capture. Capture may run at 120 FPS, while this clock remains at
+        // the negotiated encoding rate (60 FPS for our test).
+        if (config.tiled_video && bootstrap_state.real_frame_seen) {
+          const auto now = std::chrono::steady_clock::now();
+
+          if (!tiled_next_output_slot) {
+            tiled_next_output_slot = now + encode_frame_threshold;
+          }
+
+          // If we're early, wait for the scheduled slot.
+          //
+          // If we're already late, encode immediately instead of skipping this
+          // slot and sleeping for another whole frame interval. This prevents a
+          // small encoder overrun from turning into a ~33 ms output gap at 60 Hz.
+          if (now < *tiled_next_output_slot) {
+            std::this_thread::sleep_until(*tiled_next_output_slot);
+          }
+
+          const auto after_wait = std::chrono::steady_clock::now();
+
+          // Advance the grid to the first future slot. If we were badly late,
+          // this drops only the genuinely expired slots; the current iteration
+          // still encodes immediately rather than waiting for another one.
+          do {
+            *tiled_next_output_slot += encode_frame_threshold;
+          } while (*tiled_next_output_slot <= after_wait);
+
+          // Capture runs independently at up to 120 Hz. At the output slot,
+          // take the newest available frame without adding another wait.
+          image_wait_budget = decltype(max_frametime)::zero();
+        }
+
+        const auto tiled_perf_pop_started =
+          std::chrono::steady_clock::now();
+
+        auto img = images->pop(image_wait_budget);
+
+        // Capture can now run faster than output. If more than one captured
+        // image accumulated between output slots, discard the older ones and
+        // retain only the newest frame for this encode.
+        if (config.tiled_video && img) {
+          while (images->peek()) {
+            auto newer_img = images->pop(0ms);
+            if (!newer_img) {
+              break;
+            }
+
+            img = std::move(newer_img);
+          }
+        }
+
+        tiled_perf_pop_time =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() -
+            tiled_perf_pop_started
+          );
+
+        if (img) {
+            placeholder_input = is_placeholder_capture_image(*img);
           if (placeholder_input) {
             ++loop_stats.popped_placeholder;
           } else {
@@ -5070,20 +5224,43 @@ namespace video {
             frame_timestamp = capture_timestamp;
             host_processing_timestamp = img->host_processing_timestamp;
           }
-          if (session->convert(*img)) {
+          const auto tiled_perf_primary_convert_started =
+            std::chrono::steady_clock::now();
+
+          const auto primary_convert_result =
+            session->convert(*img);
+
+          tiled_perf_primary_convert_time =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() -
+              tiled_perf_primary_convert_started
+            );
+
+          if (primary_convert_result) {
             BOOST_LOG(error) << "Could not convert image"sv;
             native_amf_runtime_failed = native_amf_session;
             break;
           }
 
           if (tiled_test_secondary_session) {
-            if (tiled_test_secondary_session->convert(*img)) {
+            const auto tiled_perf_secondary_convert_started =
+              std::chrono::steady_clock::now();
+
+            const auto secondary_convert_result =
+              tiled_test_secondary_session->convert(*img);
+
+            tiled_perf_secondary_convert_time =
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() -
+                tiled_perf_secondary_convert_started
+              );
+
+            if (secondary_convert_result) {
               BOOST_LOG(error)
                 << "[TILED-TEST] Could not convert image for secondary encoder";
               break;
             }
           }
-
 #ifdef SUNSHINE_ENABLE_NV_TRUEHDR
           if (refresh_rtx_hdr_metadata_if_needed(
                 config,
@@ -5134,23 +5311,16 @@ namespace video {
 
       const auto current_frame_nr = frame_nr++;
 
-      if (encode(
-            current_frame_nr,
-            *session,
-            packets,
-            channel_data,
-            frame_timestamp,
-            capture_timestamp,
-            host_processing_timestamp
-          )) {
-        BOOST_LOG(error) << "Could not encode video packet"sv;
-        native_amf_runtime_failed = native_amf_session;
-        break;
-      }
+      int secondary_encode_result = 0;
+      std::thread secondary_encode_worker;
+
+      avcodec_encode_session_t *secondary_avcodec = nullptr;
 
       if (tiled_test_secondary_session) {
-        auto *secondary_avcodec =
-          dynamic_cast<avcodec_encode_session_t *>(tiled_test_secondary_session.get());
+        secondary_avcodec =
+          dynamic_cast<avcodec_encode_session_t *>(
+            tiled_test_secondary_session.get()
+          );
 
         if (!secondary_avcodec) {
           BOOST_LOG(error)
@@ -5158,7 +5328,15 @@ namespace video {
           break;
         }
 
-        if (encode_avcodec(
+        secondary_encode_worker = std::thread([
+          &,
+          secondary_avcodec
+        ]() {
+          const auto tiled_perf_secondary_encode_started =
+            std::chrono::steady_clock::now();
+
+          secondary_encode_result =
+            encode_avcodec(
               current_frame_nr,
               *secondary_avcodec,
               packets,
@@ -5167,11 +5345,77 @@ namespace video {
               capture_timestamp,
               host_processing_timestamp,
               1
-            )) {
+            );
+
+          tiled_perf_secondary_encode_time =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() -
+              tiled_perf_secondary_encode_started
+            );
+        });
+      }
+
+      const auto tiled_perf_primary_encode_started =
+        std::chrono::steady_clock::now();
+
+      const auto primary_encode_result =
+        encode(
+          current_frame_nr,
+          *session,
+          packets,
+          channel_data,
+          frame_timestamp,
+          capture_timestamp,
+          host_processing_timestamp
+        );
+
+      tiled_perf_primary_encode_time =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() -
+          tiled_perf_primary_encode_started
+        );
+
+      if (secondary_encode_worker.joinable()) {
+        secondary_encode_worker.join();
+      }
+
+      if (primary_encode_result) {
+        BOOST_LOG(error) << "Could not encode video packet"sv;
+        native_amf_runtime_failed = native_amf_session;
+        break;
+      }
+
+      if (tiled_test_secondary_session) {
+        if (secondary_encode_result) {
           BOOST_LOG(error)
             << "[TILED-TEST] Secondary encoder failed on frame "
             << current_frame_nr;
           break;
+        }
+
+        if (current_frame_nr <= 5 ||
+            current_frame_nr % 120 == 0) {
+
+          const auto to_ms = [](auto duration) {
+            return std::chrono::duration<double, std::milli>(
+              duration
+            ).count();
+          };
+
+          const auto processing_time =
+            tiled_perf_primary_convert_time +
+            tiled_perf_secondary_convert_time +
+            tiled_perf_primary_encode_time +
+            tiled_perf_secondary_encode_time;
+
+          BOOST_LOG(info)
+            << "[TILED-PERF] frame=" << current_frame_nr
+            << " pop=" << to_ms(tiled_perf_pop_time) << "ms"
+            << " conv0=" << to_ms(tiled_perf_primary_convert_time) << "ms"
+            << " conv1=" << to_ms(tiled_perf_secondary_convert_time) << "ms"
+            << " enc0=" << to_ms(tiled_perf_primary_encode_time) << "ms"
+            << " enc1=" << to_ms(tiled_perf_secondary_encode_time) << "ms"
+            << " processing=" << to_ms(processing_time) << "ms";
         }
 
         static uint64_t tiled_test_encoded_frames = 0;
@@ -5532,7 +5776,7 @@ namespace video {
     }
 
     auto ec = platf::capture_e::ok;
-    while (encode_session_ctx_queue.running()) {
+    while (encode_session_ctx_queue.running()) {      
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
         while (encode_session_ctx_queue.peek()) {
           auto encode_session_ctx = encode_session_ctx_queue.pop();

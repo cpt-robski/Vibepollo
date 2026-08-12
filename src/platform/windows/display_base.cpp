@@ -483,7 +483,7 @@ namespace platf::dxgi {
 
       if (auto diag_now = std::chrono::steady_clock::now(); diag_now - pacing_diag_last_log >= 10s) {
         if (pacing_bust_woke_late || pacing_bust_snapshot_miss || pacing_phase_preserved || pacing_phase_reanchored) {
-          BOOST_LOG(debug) << "WGC pacing bust mix: woke_late(a)=" << pacing_bust_woke_late
+          BOOST_LOG(info) << "WGC pacing bust mix: woke_late(a)=" << pacing_bust_woke_late
                            << " snapshot_miss(b)=" << pacing_bust_snapshot_miss
                            << " phase_preserved=" << pacing_phase_preserved
                            << " phase_reanchored=" << pacing_phase_reanchored
@@ -871,11 +871,31 @@ namespace platf::dxgi {
     display_refresh_rate_rounded = 0;
     client_frame_rate = config.framerate;
     client_frame_rate_strict = {0, 0};
+
     if (config.framerateX100 > 0) {
       AVRational fps = ::video::framerateX100_to_rational(config.framerateX100);
-      client_frame_rate_strict = DXGI_RATIONAL {static_cast<UINT>(fps.num), static_cast<UINT>(fps.den)};
+      client_frame_rate_strict = DXGI_RATIONAL {
+        static_cast<UINT>(fps.num),
+        static_cast<UINT>(fps.den)
+      };
     }
 
+    // TILED TEST:
+    // Keep the negotiated/client stream rate untouched, but run the internal
+    // capture pacer at 120 FPS so the encoder always has a fresh/latest frame
+    // available for each output slot.
+    if (config.tiled_video &&
+        config.framerate > 0 &&
+        config.framerate <= 60) {
+      client_frame_rate = 120;
+      client_frame_rate_strict = DXGI_RATIONAL {120, 1};
+
+      BOOST_LOG(info)
+        << "[TILED-PACER] Internal capture cadence forced to 120 FPS"
+        << " while negotiated stream remains "
+        << config.framerate << " FPS";
+    }
+    
     HRESULT status;
 
     status = CreateDXGIFactory1(IID_IDXGIFactory1, (void **) &factory);
