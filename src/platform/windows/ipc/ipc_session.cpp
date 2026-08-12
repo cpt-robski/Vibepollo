@@ -65,11 +65,11 @@ namespace platf::dxgi {
       return 60;
     }
 
-    int wgc_initial_activity_admission_fps(const ::video::config_t & /*config*/) {
-      // TEMP TEST: fixed high admission ceiling.
-      // Keep admission/load-shedding active, but avoid making a 60 FPS stream
-      // use the much tighter 120 FPS minimum-interval gate.
-      return 240;
+    int wgc_initial_activity_admission_fps(const ::video::config_t &config) {
+      const auto target_fps = wgc_target_fps(config);
+      return target_fps > (std::numeric_limits<int>::max)() / 2 ?
+               (std::numeric_limits<int>::max)() :
+               target_fps * 2;
     }
 
     std::int64_t wgc_min_update_interval_100ns(const ::video::config_t & /*config*/) {
@@ -95,9 +95,7 @@ namespace platf::dxgi {
     }
 
     uint32_t wgc_initial_frame_buffer_size() {
-      // TEMP TEST: keep two WGC buffers available so the compositor can
-      // produce the next frame while the callback is releasing the previous one.
-      return 2;
+      return wgc_policy::low_latency_initial_buffer_size;
     }
 
     uint32_t wgc_max_frame_buffer_size(const ::video::config_t &config) {
@@ -613,7 +611,7 @@ namespace platf::dxgi {
       _slow_event_waits.fetch_add(1, std::memory_order_relaxed);
     }
     if (frame_count == 1 || frame_count % 600 == 0 || slow_event_wait) {
-      BOOST_LOG(info) << "WGC IPC acquire timing: frame=" << frame_count
+      BOOST_LOG(debug) << "WGC IPC acquire timing: frame=" << frame_count
                        << " event_wait_ms=" << event_wait_ms
                        << " frame_id=" << _last_frame_id
                        << " slow_event_waits=" << _slow_event_waits.load(std::memory_order_relaxed)
@@ -685,13 +683,13 @@ namespace platf::dxgi {
 
     const auto frame_count = _frames_acquired.fetch_add(1, std::memory_order_relaxed) + 1;
     const auto mutex_wait_ms = std::chrono::duration<double, std::milli>(mutex_wait).count();
-    const bool sampled_frame = frame_count == 1 || frame_count % 120 == 0;
+    const bool sampled_frame = frame_count == 1 || frame_count % 600 == 0;
     const bool slow_mutex_wait = mutex_wait_ms > 1.0;
     if (slow_mutex_wait) {
       _slow_mutex_waits.fetch_add(1, std::memory_order_relaxed);
     }
     if (sampled_frame || slow_mutex_wait) {
-      BOOST_LOG(info) << "WGC IPC lock timing: frame=" << frame_count
+      BOOST_LOG(debug) << "WGC IPC lock timing: frame=" << frame_count
                        << " mutex_wait_ms=" << mutex_wait_ms
                        << " frame_id=" << _last_frame_id
                        << " slow_mutex_waits=" << _slow_mutex_waits.load(std::memory_order_relaxed);
