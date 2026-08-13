@@ -843,7 +843,7 @@ namespace platf::dxgi {
       }
 #endif
       if (!source_crop) {
-        BOOST_LOG(error) << "[TILED-TEST] Source crop buffer is missing during conversion";
+        BOOST_LOG(error) << "[TILED] Source crop buffer is missing during conversion";
         return -1;
       }
 
@@ -1398,7 +1398,7 @@ namespace platf::dxgi {
         }
 
         BOOST_LOG(info)
-          << "[TILED-TEST] Source crop configured: scale=("
+          << "[TILED] Source crop configured: scale=("
           << source_crop_scale_x << ','
           << source_crop_scale_y << ") offset=("
           << source_crop_offset_x << ','

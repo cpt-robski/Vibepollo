@@ -1152,17 +1152,6 @@ namespace video {
         return -1;
       }
 
-      static std::atomic<uint64_t> tiled_test_frame_count {0};
-      const auto frame_count = tiled_test_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
-
-      if (frame_count <= 5 || frame_count % 120 == 0) {
-        BOOST_LOG(info)
-          << "[TILED-TEST] QSV/AVCodec input frame #" << frame_count
-          << " size=" << img.width << "x" << img.height
-          << " row_pitch=" << img.row_pitch
-          << " img=" << static_cast<const void *>(&img);
-      }
-
       return device->convert(img);
     }
 
@@ -2874,91 +2863,7 @@ namespace video {
 
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
-      uint64_t tiled_capture_interval_count = 0;
-      uint64_t tiled_capture_no_frame_count = 0;
-
-      std::optional<std::chrono::steady_clock::time_point>
-        tiled_capture_last_frame_time;
-
-      double tiled_capture_interval_sum_ms = 0.0;
-      double tiled_capture_interval_min_ms = 0.0;
-      double tiled_capture_interval_max_ms = 0.0;
-
-      uint64_t tiled_capture_over_16ms = 0;
-      uint64_t tiled_capture_over_25ms = 0;
-      uint64_t tiled_capture_over_33ms = 0;
-      uint64_t tiled_capture_over_50ms = 0;
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
-
-        if (frame_captured) {
-          const auto now =
-            std::chrono::steady_clock::now();
-
-          if (tiled_capture_last_frame_time) {
-            const double interval_ms =
-              std::chrono::duration<double, std::milli>(
-                now - *tiled_capture_last_frame_time
-              ).count();
-
-            ++tiled_capture_interval_count;
-            tiled_capture_interval_sum_ms += interval_ms;
-
-            if (tiled_capture_interval_count == 1) {
-              tiled_capture_interval_min_ms = interval_ms;
-              tiled_capture_interval_max_ms = interval_ms;
-            } else {
-              tiled_capture_interval_min_ms =
-                std::min(tiled_capture_interval_min_ms, interval_ms);
-
-              tiled_capture_interval_max_ms =
-                std::max(tiled_capture_interval_max_ms, interval_ms);
-            }
-
-            if (interval_ms > 16.67) {
-              ++tiled_capture_over_16ms;
-            }
-
-            if (interval_ms > 25.0) {
-              ++tiled_capture_over_25ms;
-            }
-
-            if (interval_ms > 33.33) {
-              ++tiled_capture_over_33ms;
-            }
-
-            if (interval_ms > 50.0) {
-              ++tiled_capture_over_50ms;
-            }
-
-            if ((tiled_capture_interval_count % 120) == 0) {
-              BOOST_LOG(info)
-                << "[TILED-CAPTURE] frames="
-                << tiled_capture_interval_count
-                << " avg="
-                << (tiled_capture_interval_sum_ms /
-                    tiled_capture_interval_count)
-                << "ms min="
-                << tiled_capture_interval_min_ms
-                << "ms max="
-                << tiled_capture_interval_max_ms
-                << "ms >16.67="
-                << tiled_capture_over_16ms
-                << " >25="
-                << tiled_capture_over_25ms
-                << " >33.33="
-                << tiled_capture_over_33ms
-                << " >50="
-                << tiled_capture_over_50ms
-                << " no_frame="
-                << tiled_capture_no_frame_count;
-            }
-          }
-
-          tiled_capture_last_frame_time = now;
-        }
-        else {
-          ++tiled_capture_no_frame_count;
-        }
 
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
           if (!capture_ctx->images->running()) {
@@ -3236,7 +3141,7 @@ namespace video {
     if (ret < 0) {
       char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
       BOOST_LOG(error)
-        << "[TILED-TEST] Secondary encoder could not accept frame "
+        << "[TILED] Secondary encoder could not accept frame "
         << frame_nr << ": "
         << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
       return -1;
@@ -3257,7 +3162,7 @@ namespace video {
       if (ret < 0) {
         char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
         BOOST_LOG(error)
-          << "[TILED-TEST] Secondary encoder failed receiving frame "
+          << "[TILED] Secondary encoder failed receiving frame "
           << frame_nr << ": "
           << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
         return -1;
@@ -4606,7 +4511,7 @@ namespace video {
     if (tiled_dual_test) {
       if ((encoder_config.width & 1) != 0) {
         BOOST_LOG(error)
-          << "[TILED-TEST] Cannot split odd encoder width "
+          << "[TILED] Cannot split odd encoder width "
           << encoder_config.width;
         return encode_run_result_e::initialization_failed;
       }
@@ -4619,7 +4524,7 @@ namespace video {
       encode_device->source_crop_offset_y = 0.0f;
 
       BOOST_LOG(info)
-        << "[TILED-TEST] Dual tile mode: capture="
+        << "[TILED] Dual tile mode: capture="
         << disp->width << 'x' << disp->height
         << " client="
         << config.width << 'x' << config.height
@@ -4646,19 +4551,19 @@ namespace video {
       return encode_run_result_e::initialization_failed;
     }
 
-    std::unique_ptr<encode_session_t> tiled_test_secondary_session;
+    std::unique_ptr<encode_session_t> tiled_secondary_session;
 
     #ifdef _WIN32
     if (tiled_dual_test) {
       BOOST_LOG(info)
-        << "[TILED-TEST] Creating secondary AVCodec encoder for RIGHT tile";
+        << "[TILED] Creating secondary AVCodec encoder for RIGHT tile";
 
       auto secondary_device =
         make_encode_device(*disp, encoder, encoder_config, hdr_latch, false);
 
       if (!secondary_device) {
         BOOST_LOG(error)
-          << "[TILED-TEST] Failed to create secondary encode device";
+          << "[TILED] Failed to create secondary encode device";
         return encode_run_result_e::initialization_failed;
       }
 
@@ -4667,7 +4572,7 @@ namespace video {
       secondary_device->source_crop_offset_x = 0.5f;
       secondary_device->source_crop_offset_y = 0.0f;
 
-      tiled_test_secondary_session = make_encode_session(
+      tiled_secondary_session = make_encode_session(
         disp.get(),
         encoder,
         encoder_config,
@@ -4678,14 +4583,14 @@ namespace video {
         initialization_cancelled
       );
 
-      if (!tiled_test_secondary_session) {
+      if (!tiled_secondary_session) {
         BOOST_LOG(error)
-          << "[TILED-TEST] Failed to create secondary AVCodec encoder";
+          << "[TILED] Failed to create secondary AVCodec encoder";
         return encode_run_result_e::initialization_failed;
       }
 
       BOOST_LOG(info)
-        << "[TILED-TEST] Secondary AVCodec encoder created successfully";
+        << "[TILED] Secondary AVCodec encoder created successfully";
     }
     #endif
 
@@ -4907,10 +4812,10 @@ namespace video {
         return native_amf_failure();
       }
 
-      if (tiled_test_secondary_session &&
-          tiled_test_secondary_session->convert(*dummy_img)) {
+      if (tiled_secondary_session &&
+          tiled_secondary_session->convert(*dummy_img)) {
         BOOST_LOG(error)
-          << "[TILED-TEST] Could not convert dummy image for secondary encoder";
+          << "[TILED] Could not convert dummy image for secondary encoder";
         return encode_run_result_e::initialization_failed;
       }
     }
@@ -5070,12 +4975,6 @@ namespace video {
       std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
       bool placeholder_input = bootstrap_state.current_input_placeholder;
 
-      std::chrono::nanoseconds tiled_perf_pop_time {0};
-      std::chrono::nanoseconds tiled_perf_primary_convert_time {0};
-      std::chrono::nanoseconds tiled_perf_secondary_convert_time {0};
-      std::chrono::nanoseconds tiled_perf_primary_encode_time {0};
-      std::chrono::nanoseconds tiled_perf_secondary_encode_time {0};
-
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         auto image_wait_budget = max_frametime;
@@ -5184,9 +5083,6 @@ namespace video {
           image_wait_budget = decltype(max_frametime)::zero();
         }
 
-        const auto tiled_perf_pop_started =
-          std::chrono::steady_clock::now();
-
         auto img = images->pop(image_wait_budget);
 
         // Capture can now run faster than output. If more than one captured
@@ -5203,12 +5099,6 @@ namespace video {
           }
         }
 
-        tiled_perf_pop_time =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() -
-            tiled_perf_pop_started
-          );
-
         if (img) {
             placeholder_input = is_placeholder_capture_image(*img);
           if (placeholder_input) {
@@ -5224,17 +5114,8 @@ namespace video {
             frame_timestamp = capture_timestamp;
             host_processing_timestamp = img->host_processing_timestamp;
           }
-          const auto tiled_perf_primary_convert_started =
-            std::chrono::steady_clock::now();
-
           const auto primary_convert_result =
             session->convert(*img);
-
-          tiled_perf_primary_convert_time =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() -
-              tiled_perf_primary_convert_started
-            );
 
           if (primary_convert_result) {
             BOOST_LOG(error) << "Could not convert image"sv;
@@ -5242,22 +5123,13 @@ namespace video {
             break;
           }
 
-          if (tiled_test_secondary_session) {
-            const auto tiled_perf_secondary_convert_started =
-              std::chrono::steady_clock::now();
-
+          if (tiled_secondary_session) {
             const auto secondary_convert_result =
-              tiled_test_secondary_session->convert(*img);
-
-            tiled_perf_secondary_convert_time =
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() -
-                tiled_perf_secondary_convert_started
-              );
+              tiled_secondary_session->convert(*img);
 
             if (secondary_convert_result) {
               BOOST_LOG(error)
-                << "[TILED-TEST] Could not convert image for secondary encoder";
+                << "[TILED] Could not convert image for secondary encoder";
               break;
             }
           }
@@ -5316,15 +5188,15 @@ namespace video {
 
       avcodec_encode_session_t *secondary_avcodec = nullptr;
 
-      if (tiled_test_secondary_session) {
+      if (tiled_secondary_session) {
         secondary_avcodec =
           dynamic_cast<avcodec_encode_session_t *>(
-            tiled_test_secondary_session.get()
+            tiled_secondary_session.get()
           );
 
         if (!secondary_avcodec) {
           BOOST_LOG(error)
-            << "[TILED-TEST] Secondary session unexpectedly stopped being AVCodec";
+            << "[TILED] Secondary session unexpectedly stopped being AVCodec";
           break;
         }
 
@@ -5332,9 +5204,6 @@ namespace video {
           &,
           secondary_avcodec
         ]() {
-          const auto tiled_perf_secondary_encode_started =
-            std::chrono::steady_clock::now();
-
           secondary_encode_result =
             encode_avcodec(
               current_frame_nr,
@@ -5346,17 +5215,8 @@ namespace video {
               host_processing_timestamp,
               1
             );
-
-          tiled_perf_secondary_encode_time =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() -
-              tiled_perf_secondary_encode_started
-            );
         });
       }
-
-      const auto tiled_perf_primary_encode_started =
-        std::chrono::steady_clock::now();
 
       const auto primary_encode_result =
         encode(
@@ -5369,12 +5229,6 @@ namespace video {
           host_processing_timestamp
         );
 
-      tiled_perf_primary_encode_time =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() -
-          tiled_perf_primary_encode_started
-        );
-
       if (secondary_encode_worker.joinable()) {
         secondary_encode_worker.join();
       }
@@ -5385,47 +5239,12 @@ namespace video {
         break;
       }
 
-      if (tiled_test_secondary_session) {
+      if (tiled_secondary_session) {
         if (secondary_encode_result) {
           BOOST_LOG(error)
-            << "[TILED-TEST] Secondary encoder failed on frame "
+            << "[TILED] Secondary encoder failed on frame "
             << current_frame_nr;
           break;
-        }
-
-        if (current_frame_nr <= 5 ||
-            current_frame_nr % 120 == 0) {
-
-          const auto to_ms = [](auto duration) {
-            return std::chrono::duration<double, std::milli>(
-              duration
-            ).count();
-          };
-
-          const auto processing_time =
-            tiled_perf_primary_convert_time +
-            tiled_perf_secondary_convert_time +
-            tiled_perf_primary_encode_time +
-            tiled_perf_secondary_encode_time;
-
-          BOOST_LOG(info)
-            << "[TILED-PERF] frame=" << current_frame_nr
-            << " pop=" << to_ms(tiled_perf_pop_time) << "ms"
-            << " conv0=" << to_ms(tiled_perf_primary_convert_time) << "ms"
-            << " conv1=" << to_ms(tiled_perf_secondary_convert_time) << "ms"
-            << " enc0=" << to_ms(tiled_perf_primary_encode_time) << "ms"
-            << " enc1=" << to_ms(tiled_perf_secondary_encode_time) << "ms"
-            << " processing=" << to_ms(processing_time) << "ms";
-        }
-
-        static uint64_t tiled_test_encoded_frames = 0;
-        ++tiled_test_encoded_frames;
-
-        if (tiled_test_encoded_frames <= 5 ||
-            tiled_test_encoded_frames % 120 == 0) {
-          BOOST_LOG(info)
-            << "[TILED-TEST] Native secondary tile queued frame="
-            << current_frame_nr;
         }
       }
       ++loop_stats.encoded;

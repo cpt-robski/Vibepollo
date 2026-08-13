@@ -2255,17 +2255,6 @@ namespace stream {
 
           frame_network_latency_logger.second_point_now_and_log();
 
-          if (packet->frame_index() <= 5 || packet->frame_index() % 120 == 0) {
-            BOOST_LOG(info)
-              << "[TILED-TRANSPORT] tile=" << static_cast<int>(packet->tile_id)
-              << " frame=" << packet->frame_index()
-              << " ssrc=0x"
-              << std::hex
-              << (packet->tile_id == 1 ? 0x4D4C5431u : 0u)
-              << std::dec
-              << " next_seq=" << lowseq;
-          }
-
           BOOST_LOG(verbose) << "Sent Frame seq ["sv << packet->frame_index() << "] pts ["sv << timestamp
                              << "] shards ["sv << shards.size() << "/"sv << shards.percentage << "%]"sv
                              << (frame_is_dupe ? " Dupe" : "")
