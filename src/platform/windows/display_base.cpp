@@ -880,22 +880,6 @@ namespace platf::dxgi {
       };
     }
 
-    // TILED TEST:
-    // Keep the negotiated/client stream rate untouched, but run the internal
-    // capture pacer at 120 FPS so the encoder always has a fresh/latest frame
-    // available for each output slot.
-    if (config.tiled_video &&
-        config.framerate > 0 &&
-        config.framerate <= 60) {
-      client_frame_rate = 120;
-      client_frame_rate_strict = DXGI_RATIONAL {120, 1};
-
-      BOOST_LOG(info)
-        << "[TILED-PACER] Internal capture cadence forced to 120 FPS"
-        << " while negotiated stream remains "
-        << config.framerate << " FPS";
-    }
-    
     HRESULT status;
 
     status = CreateDXGIFactory1(IID_IDXGIFactory1, (void **) &factory);
